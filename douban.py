@@ -15,6 +15,8 @@ import os  # 操作系统相关功能
 # 全局配置参数
 CHROME_DRIVER_PATH = r"D:\Program Files (x86)\chromedriver-win64\chromedriver.exe"  # Chrome驱动程序路径
 OUTPUT_FILE = "douban_watched_2025.csv"  # 输出文件名
+TEMP_FILE = "douban_watched_temp.csv"  # 临时文件名
+PROGRESS_FILE = "douban_progress.txt"  # 进度文件名
 LOGIN_TIMEOUT = 300  # 手动登录超时时间（秒）
 
 class DoubanWatchedSpider:
@@ -119,37 +121,104 @@ class DoubanWatchedSpider:
         """
         获取用户的观影记录
         遍历所有页面，提取电影标题
+        支持断点续传功能
         返回：包含所有电影标题的列表
         """
         print("正在获取观影记录...")
         base_url = f"https://movie.douban.com/people/{self.user_id}/collect"
         movie_list = []
+        start_page = 0
+
+        # 检查是否存在进度文件和临时数据
+        if os.path.exists(PROGRESS_FILE) and os.path.exists(TEMP_FILE):
+            try:
+                with open(PROGRESS_FILE, 'r') as f:
+                    start_page = int(f.read().strip())
+                with open(TEMP_FILE, 'r', encoding='utf-8-sig') as f:
+                    reader = csv.reader(f)
+                    next(reader)  # 跳过表头
+                    movie_list = [{
+                        "title": row[1],
+                        "url": row[2],
+                        "watch_date": row[3],
+                        "intro": row[4],
+                        "comment": row[5]
+                    } for row in reader]  # 读取电影信息
+                print(f"从第 {start_page + 1} 页继续获取数据...")
+            except Exception as e:
+                print(f"读取断点续传文件失败：{str(e)}")
+                start_page = 0
+                movie_list = []
         
-        # 遍历所有页面（每页30条记录）
-        for page in range(17):
-            start = page * 30
-            url = f"{base_url}?start={start}&sort=time&rating=all&mode=list&type=all&filter=all"
-            print(f"解析第 {page + 1} 页...")
-            
-            self.driver.get(url)
-            self._close_new_ads()
-            
-            # 等待页面加载完成
-            self.wait.until(EC.presence_of_element_located(
-                (By.CSS_SELECTOR, ".list-view .item")
-            ))
-            
-            # 使用BeautifulSoup解析页面，提取电影标题
-            soup = BeautifulSoup(self.driver.page_source, "html.parser")
-            items = soup.select(".list-view .item")
-            
-            for item in items:
-                title = item.select_one(".title a").get_text(strip=True)
-                movie_list.append(title)
-                print(f"获取：{title[:10]}...")
-            
-            # 添加随机延迟避免请求过快
-            time.sleep(random.uniform(1, 3))
+        try:
+            # 遍历所有页面（每页30条记录）
+            for page in range(start_page, 17):
+                start = page * 30
+                url = f"{base_url}?start={start}&sort=time&rating=all&mode=list&type=all&filter=all"
+                print(f"解析第 {page + 1} 页...")
+                
+                self.driver.get(url)
+                self._close_new_ads()
+                
+                # 等待页面加载完成
+                self.wait.until(EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, ".list-view .item")
+                ))
+                
+                # 使用BeautifulSoup解析页面，提取电影标题
+                soup = BeautifulSoup(self.driver.page_source, "html.parser")
+                items = soup.select(".list-view .item")
+                
+                page_movies = []
+                for item in items:
+                    # 获取标题和链接
+                    title_elem = item.select_one(".title a")
+                    title = title_elem.get_text(strip=True)
+                    movie_url = title_elem["href"]
+                    
+                    # 获取观看日期
+                    watch_date = item.select_one(".date").get_text(strip=True)
+                    
+                    # 获取电影简介
+                    intro = item.select_one(".intro")
+                    movie_intro = intro.get_text(strip=True) if intro else ""
+                    
+                    # 获取评价内容
+                    comment = item.select_one(".comment")
+                    movie_comment = comment.get_text(strip=True) if comment else ""
+                    
+                    # 构建电影信息字典
+                    movie_info = {
+                        "title": title,
+                        "url": movie_url,
+                        "watch_date": watch_date,
+                        "intro": movie_intro,
+                        "comment": movie_comment
+                    }
+                    page_movies.append(movie_info)
+                    print(f"获取：{title[:10]}...")
+                
+                # 将本页数据添加到列表
+                movie_list.extend(page_movies)
+                
+                # 保存当前进度和临时数据
+                with open(PROGRESS_FILE, 'w') as f:
+                    f.write(str(page))
+                self.save_to_csv(movie_list, TEMP_FILE)
+                
+                # 添加随机延迟避免请求过快
+                time.sleep(random.uniform(1, 3))
+        except Exception as e:
+            print(f"获取数据时发生错误：{str(e)}")
+            print("已保存当前进度，下次运行时将从中断处继续")
+            return movie_list
+        
+        # 清理临时文件
+        try:
+            os.remove(PROGRESS_FILE)
+            os.remove(TEMP_FILE)
+        except:
+            pass
         
         return movie_list
 
@@ -169,18 +238,26 @@ class DoubanWatchedSpider:
         except:
             return False
 
-    def save_to_csv(self, data):
+    def save_to_csv(self, data, filename=None):
         """
         将电影数据保存到CSV文件
         参数：
             data: 包含电影标题的列表
+            filename: 保存的文件名，默认为OUTPUT_FILE
         """
-        with open(OUTPUT_FILE, "w", newline="", encoding="utf-8-sig") as f:
+        save_file = filename if filename else OUTPUT_FILE
+        with open(save_file, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
-            writer.writerow(["序号", "电影名称", "采集时间"])  # 写入表头
-            writer.writerows([[i+1, item, time.strftime("%Y-%m-%d %H:%M")] 
+            writer.writerow(["序号", "电影名称", "豆瓣链接", "观看时间", "电影简介", "评价内容"])  # 写入表头
+            writer.writerows([[i+1, 
+                              item["title"], 
+                              item["url"],
+                              item["watch_date"],
+                              item["intro"],
+                              item["comment"]] 
                             for i, item in enumerate(data)])  # 写入数据行
-        print(f"数据已保存至 {OUTPUT_FILE}，共 {len(data)} 条记录")
+        if filename != TEMP_FILE:  # 只在保存最终文件时显示信息
+            print(f"数据已保存至 {save_file}，共 {len(data)} 条记录")
 
     def run(self):
         """
